@@ -1,145 +1,184 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     filters,
     ContextTypes,
 )
-from datetime import datetime
 from fichajes import registrar_fichaje, validar_fecha, leer_fichajes
 from turnos import planificar_turnos
 from horas import generar_reporte_horas
 from recordatorios import enviar_recordatorio, verificar_geolocalizacion
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+TOKEN = '8174097868:AAFzP4wkQFh9gxJhir0rIo5I-Q9JEfsADZ4'
+
+logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    keyboard = [
-        [InlineKeyboardButton("Ver fichajes", callback_data='ver_fichajes')],
-        [InlineKeyboardButton("Registrar fichaje", callback_data='registrar_fichaje')],
-        [InlineKeyboardButton("Planificar turnos", callback_data='planificar_turnos')],
-        [InlineKeyboardButton("Generar reporte de horas", callback_data='reporte_horas')],
-        [InlineKeyboardButton("Recordatorio de fichaje", callback_data='recordatorio')]
-    ]
-    await update.effective_message.reply_text(
-        f"¡Hola {user.first_name}! ¿Qué deseas hacer?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+# ——— Construye el menú inline principal ———
+def menu_principal() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗓 Horas por mes",    callback_data='horas_por_mes'),
+         InlineKeyboardButton("📊 Resumen",          callback_data='resumen')],
+        [InlineKeyboardButton("🔍 Ver detallados",  callback_data='ver_detallados')],
+        [InlineKeyboardButton("✅ Fichar entrada",   callback_data='fichar_entrada'),
+         InlineKeyboardButton("🏁 Fichar salida",    callback_data='fichar_salida')],
+        [InlineKeyboardButton("📋 Planificar turnos",callback_data='planificar_turnos'),
+         InlineKeyboardButton("✍️ Fichaje manual",   callback_data='fichaje_manual')],
+    ])
 
-async def ver_fichajes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Ver mes específico", callback_data='mes_especifico')],
-        [InlineKeyboardButton("Volver al menú principal", callback_data='start')]
-    ]
-    await update.callback_query.edit_message_text(
-        "Selecciona un mes (MM/AAAA o 'junio 2025'):",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+# ——— /start ———
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saluda y muestra el menú."""
+    user = update.effective_user.first_name
+    await update.message.reply_text(
+        f"¡Hola {user}! Elige una acción:",
+        reply_markup=menu_principal()
     )
+    context.user_data.clear()
 
-async def registrar_fichaje_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Entrada", callback_data='entrada')],
-        [InlineKeyboardButton("Salida", callback_data='salida')],
-        [InlineKeyboardButton("Volver al menú principal", callback_data='start')]
-    ]
-    await update.callback_query.edit_message_text(
-        "Selecciona el tipo de fichaje:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+# ——— Router de botones ———
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    acción = q.data
+    user = q.from_user.first_name
+    await q.answer()
 
-async def planificar_turnos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Planificar turnos", callback_data='confirmar_planificacion')],
-        [InlineKeyboardButton("Volver al menú principal", callback_data='start')]
-    ]
-    await update.callback_query.edit_message_text(
-        "Selecciona los turnos a asignar:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # 1) Horas por mes → envía imagen
+    if acción == 'horas_por_mes':
+        mes, año = datetime.now().month, datetime.now().year
+        ruta_png = generar_reporte_horas(user, mes, año)
+        await q.message.reply_photo(open(ruta_png, 'rb'))
+        return await q.message.reply_text("Menú:", reply_markup=menu_principal())
 
-async def generar_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Generar reporte", callback_data='generar_reporte')],
-        [InlineKeyboardButton("Volver al menú principal", callback_data='start')]
-    ]
-    await update.callback_query.edit_message_text(
-        "Generando reporte de horas trabajadas...",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # 2) Resumen → pide rango de fechas
+    if acción == 'resumen':
+        context.user_data['modo'] = 'resumen'
+        return await q.message.reply_text(
+            "Escribe rango DD/MM/AAAA-DD/MM/AAAA:",
+            reply_markup=menu_principal()
+        )
 
-async def recordatorio_fichaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    empleado = update.effective_user.first_name
-    lat, lon = update.effective_message.location.latitude, update.effective_message.location.longitude
+    # 3) Ver detallados → lista de hoy
+    if acción == 'ver_detallados':
+        hoy = datetime.now().strftime("%d/%m/%Y")
+        todos = leer_fichajes()
+        lista = [f"{f['hora']} {f['usuario']} {f['tipo']}" 
+                 for f in todos if f['fecha'].startswith(hoy)]
+        texto = "\n".join(lista) or "No hay fichajes hoy."
+        await q.message.reply_text(texto)
+        return await q.message.reply_text("Menú:", reply_markup=menu_principal())
+
+    # 4) Fichar entrada → pide ubicación
+    if acción == 'fichar_entrada':
+        context.user_data['modo'] = 'geo_entrada'
+        return await q.message.reply_text(
+            "🔔 Comparte tu ubicación para fichar ENTRADA",
+            reply_markup=menu_principal()
+        )
+
+    # 5) Fichar salida → pide ubicación
+    if acción == 'fichar_salida':
+        context.user_data['modo'] = 'geo_salida'
+        return await q.message.reply_text(
+            "🔔 Comparte tu ubicación para fichar SALIDA",
+            reply_markup=menu_principal()
+        )
+
+    # 6) Planificar turnos → supón que aquí ya has seleccionado empleados
+    if acción == 'planificar_turnos':
+        # Ejemplo estático; en tu versión tendrás un submenú de empleados:
+        empleados = context.user_data.get('seleccionados', [])
+        texto = planificar_turnos(empleados)
+        await q.message.reply_text(f"Turnos:\n{texto}")
+        return await q.message.reply_text("Menú:", reply_markup=menu_principal())
+
+    # 7) Fichaje manual → pide parámetros
+    if acción == 'fichaje_manual':
+        context.user_data['modo'] = 'manual'
+        return await q.message.reply_text(
+            "✏️ Envía: ID_USUARIO ENTRADA|SALIDA DD/MM/AAAA HH:MM:SS",
+            reply_markup=menu_principal()
+        )
+
+    # 8) Por defecto, vuelve a mostrar menú
+    return await q.message.reply_text("Menú:", reply_markup=menu_principal())
+
+# ——— Mensajes de texto (resumen y manual) ———
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    modo = context.user_data.get('modo')
+    user = update.effective_user.first_name
+    txt = update.message.text.strip()
+
+    # Resumen de fechas
+    if modo == 'resumen':
+        try:
+            ini, fin = txt.split('-')
+            di = datetime.strptime(ini.strip(), "%d/%m/%Y")
+            df = datetime.strptime(fin.strip(), "%d/%m/%Y")
+        except:
+            return await update.message.reply_text(
+                "Formato inválido.", reply_markup=menu_principal()
+            )
+        hits = [f for f in leer_fichajes()
+                if f['usuario']==user and 
+                   di <= datetime.strptime(f['fecha'], "%d/%m/%Y %H:%M:%S") <= df]
+        e = sum(1 for f in hits if f['tipo']=='entrada')
+        s = sum(1 for f in hits if f['tipo']=='salida')
+        await update.message.reply_text(
+            f"Entradas: {e}, Salidas: {s}", reply_markup=menu_principal()
+        )
+        context.user_data.clear()
+        return
+
+    # Fichaje manual
+    if modo == 'manual':
+        partes = txt.split()
+        if len(partes)!=4:
+            return await update.message.reply_text(
+                "Formato inválido.", reply_markup=menu_principal()
+            )
+        uid, tipo, fecha, hora = partes
+        ts = f"{fecha} {hora}"
+        registrar_fichaje(int(uid), tipo.lower(), ts, user)
+        await update.message.reply_text("✅ Fichaje manual guardado.", reply_markup=menu_principal())
+        context.user_data.clear()
+        return
+
+    # Si no estaba en modo, invito a usar el menú
+    await update.message.reply_text("Pulsa un botón del menú.", reply_markup=menu_principal())
+
+# ——— Mensajes de ubicación ———
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    modo = context.user_data.get('modo')
+    if modo not in ('geo_entrada','geo_salida'):
+        return
+    lat, lon = update.message.location.latitude, update.message.location.longitude
+    tipo = 'entrada' if modo=='geo_entrada' else 'salida'
     if verificar_geolocalizacion((lat, lon), (40.4168, -3.7038)):
-        enviar_recordatorio(empleado, "fichaje")
-        await update.effective_message.reply_text("¡Recordatorio enviado!")
+        ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        registrar_fichaje(update.effective_chat.id, tipo, ts, update.effective_user.first_name)
+        await update.message.reply_text(f"✅ {tipo.capitalize()} a las {ts}", reply_markup=menu_principal())
     else:
-        await update.effective_message.reply_text("Parece que no estás cerca del lugar de trabajo.")
+        await update.message.reply_text("🚫 Fuera de rango.", reply_markup=menu_principal())
+    context.user_data.clear()
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    data = query.data
-    await query.answer()
-
-    if data == 'ver_fichajes':
-        await ver_fichajes(update, context)
-
-    elif data == 'registrar_fichaje':
-        await registrar_fichaje_cmd(update, context)
-
-    # Aquí manejamos los dos nuevos casos:
-    elif data in ('entrada', 'salida'):
-        tipo = data  # "entrada" o "salida"
-        chat_id = query.message.chat_id
-        now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        # Llamada a tu función real; ajústala si tu firma es distinta:
-        registrar_fichaje(chat_id, tipo, now)
-        await query.edit_message_text(f"✅ {tipo.capitalize()} registrada manualmente a las {now}")
-        # Volvemos al menú principal si quieres:
-        await start(update, context)
-
-    elif data == 'planificar_turnos':
-        await planificar_turnos_cmd(update, context)
-
-    elif data == 'reporte_horas':
-        await generar_reporte(update, context)
-
-    elif data == 'recordatorio':
-        await query.edit_message_text("Por favor, envía tu ubicación para verificar tu cercanía.")
-
-    elif data == 'start':
-        await start(update, context)
-
-    else:
-        await query.edit_message_text("Opción no reconocida. Regresando al menú principal...")
-        await start(update, context)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
-
-def main() -> None:
-    TOKEN = '8174097868:AAFzP4wkQFh9gxJhir0rIo5I-Q9JEfsADZ4'
+# ——— Montaje final ———
+def main():
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
+    app.run_polling()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.LOCATION, recordatorio_fichaje))
-    # Cualquier texto reabre el menú
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
-
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
